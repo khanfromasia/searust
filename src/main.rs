@@ -1,6 +1,6 @@
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::collections::HashMap;
+use std::path::Path;
+
 use std::env;
 use std::result::Result;
 use std::process::ExitCode;
@@ -9,62 +9,10 @@ use std::str;
 use xml::reader::{XmlEvent, EventReader};
 use xml::common::{Position, TextPosition};
 
-use tiny_http::{Server, Response, Header, Method, Request, StatusCode};
+mod model;
+use model::*;
+mod server;
 
-struct Lexer<'a> {
-    content: &'a [char],
-}
-
-impl<'a> Lexer<'a> {
-    fn new(content: &'a [char]) -> Self {
-        Self { content }
-    }
-
-    fn trim_left(&mut self) {
-        while !self.content.is_empty() && self.content[0].is_whitespace() {
-            self.content = &self.content[1..];
-        }
-    }
-
-    fn chop(&mut self, n: usize) -> &'a [char] {
-        let token = &self.content[0..n];
-        self.content = &self.content[n..];
-        token
-    }
-
-    fn chop_while<P>(&mut self, mut predicate: P) -> &'a [char] where P: FnMut(&char) -> bool {
-        let mut n = 0;
-        while n < self.content.len() && predicate(&self.content[n]) {
-            n += 1;
-        }
-        self.chop(n)
-    }
-
-    fn next_token(&mut self) -> Option<String> {
-        self.trim_left();
-        if self.content.is_empty() {
-            return None
-        }
-
-        if self.content[0].is_numeric() {
-            return Some(self.chop_while(|x| x.is_numeric()).iter().collect());
-        }
-
-        if self.content[0].is_alphabetic() {
-            return Some(self.chop_while(|x| x.is_alphanumeric()).iter().map(|x| x.to_ascii_uppercase()).collect());
-        }
-
-        return Some(self.chop(1).iter().collect());
-    }
-}
-
-impl<'a> Iterator for Lexer<'a> {
-    type Item = String;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        self.next_token()
-    }
-}
 
 fn parse_entire_xml_file(file_path: &Path) -> Result<String, ()> {
     let file = File::open(file_path).map_err(|err| {
@@ -85,25 +33,6 @@ fn parse_entire_xml_file(file_path: &Path) -> Result<String, ()> {
         }
     }
     Ok(content)
-}
-
-type TermFreq = HashMap::<String, usize>;
-type TermFreqIndex = HashMap<PathBuf, TermFreq>;
-
-fn check_index(index_path: &str) -> Result<(), ()> {
-    println!("Reading {index_path} index file...");
-
-    let index_file = File::open(index_path).map_err(|err| {
-        eprintln!("ERROR: could not open index file {index_path}: {err}");
-    })?;
-
-    let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
-        eprintln!("ERROR: could not parse index file {index_path}: {err}");
-    })?;
-
-    println!("{index_path} contains {count} files", count = tf_index.len());
-
-    Ok(())
 }
 
 fn save_tf_index(tf_index: &TermFreqIndex, index_path: &str) -> Result<(), ()> {
@@ -171,101 +100,8 @@ fn usage(program: &str) {
     eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
     eprintln!("Subcommands:");
     eprintln!("\tindex <folder>                  index the <folder> and save the index to index.json file");
-    eprintln!("\tsearch <index-file>             check how many documents are indexed in the file (searching is not implemented yet)");
+    eprintln!("\tsearch <index-file> <query>     search <query> within the <index-file>");
     eprintln!("\tserve  <index-file> [address]   start local http server with web UI");
-}
-
-fn serve_static_file(request: Request, file_path: &str, content_type: &str) -> Result<(), ()> {
-    let content_type_header = Header::from_bytes("Content-Type", content_type)
-        .expect("don't put any garbage into headers");
-            
-    let file = File::open(file_path).map_err(|err| {
-        eprintln!("ERROR: could not serve static file {file_path}: {err}");
-    })?;
-
-    let response = Response::from_file(file).with_header(content_type_header);
-    request.respond(response).map_err(|err| {
-        eprintln!("ERROR: could not serve a request: {err}");
-    })?;
-
-    Ok(())
-}
-
-fn serve_404(request: Request) -> Result<(), ()> {
-    request.respond(Response::from_string("404").with_status_code(StatusCode::from(404))).map_err(|err| {
-        eprintln!("ERROR: could not serve a request: {err}");
-    })
-}
-
-fn serve_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), ()> {
-    println!("INFO: request received: {:?} {:?}", request.method(), request.url());
-
-    match request.method() {
-        Method::Get => {
-            match request.url() {
-                "/" | "/index.html" => {
-                    serve_static_file(request, "index.html", "text/html; charset=utf-8")
-                },
-                "/index.js" => {
-                    serve_static_file(request, "index.js", "text/javascript; charset=utf-8")
-                },
-                _ => {
-                    serve_404(request)
-                }
-            }
-        },
-        Method::Post => {
-            match request.url() {
-                "/api/search" => {
-                    let mut buf = Vec::new();
-                    request.as_reader().read_to_end(&mut buf);
-                    let body = str::from_utf8(&buf).map_err(|err| {
-                        eprintln!("ERROR: could not interpert bodt as UTF-8 string: {err}");
-                    })?.chars().collect::<Vec<_>>();
-                    
-                    let mut  result = Vec::<(&PathBuf, f32)>::new();
-
-                    for (path, tf_table) in tf_index {
-                        let mut rank = 0f32;
-                        for term  in Lexer::new(&body) {
-                            rank += term_frequency(&term, tf_table) * inverse_document_frequency(&term, tf_index); 
-                        }
-                        result.push((path, rank));  
-                    }
-
-                    result.sort_by(|(_, rank1),  (_, rank2)| rank1.partial_cmp(rank2).unwrap() );
-                    result.reverse(); 
-
-                    for (path, rank) in result.iter().take(10 ) {
-                        println!("{path} => {rank}", path = path.display(), rank = rank); 
-                    }
-                    
-                    request.respond(Response::from_string("ok")).map_err(|err| {
-                        eprintln!("ERROR: could not serve a  : {err}");
-                    })
-                }, 
-                _ => {
-                    serve_404(request)
-                }
-            }
-        },
-        _ => {
-            serve_404(request)
-        }
-    }
-}  
-
-fn term_frequency(term: &str, document: &TermFreq) -> f32 {
-    let a = document.get(term).cloned().unwrap_or(0) as f32;
-    let b  = document.iter().map(|(_, f)| *f).sum::<usize>() as f32;
-    a / b
-}
-
-fn inverse_document_frequency(term: &str, document: &TermFreqIndex) -> f32 {
-    let n = document.len() as f32;
-    let mut m = document.values().filter(|tf | tf.contains_key(term)).count().max(1) as f32;
-   
-    (n / m).log10() 
 }
 
 fn entry() -> Result<(), ()> {  
@@ -294,7 +130,22 @@ fn entry() -> Result<(), ()> {
                 eprintln!("ERROR: no path to index is provided for {subcommand} subcommand");
             })?;  
 
-            check_index(&index_path)?;
+            let prompt = args.next().ok_or_else(|| {
+                usage(&program);
+                eprintln!("ERROR: no search query is provided {subcommand} subcommand");
+            })?.chars().collect::<Vec<_>>();
+
+            let index_file = File::open(&index_path).map_err(|err| {
+                eprintln!("ERROR: could not open index file {index_path}: {err}");
+            })?;
+
+            let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
+                eprintln!("ERROR: could not parse index file {index_path}: {err}");
+            })?;
+
+            for (path, rank) in search_query(&tf_index, &prompt).iter().take(20) {
+                println!("{path} {rank}", path = path.display());
+            }
         },
         "serve" => {
             let index_path = args.next().ok_or_else(|| {
@@ -310,21 +161,9 @@ fn entry() -> Result<(), ()> {
                 eprintln!("ERROR: could not parse index file {index_path}: {err}");
             })?;
         
-
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
-            let server = Server::http(&address).map_err(|err| {
-                eprintln!("ERROR: could not start http server at {address}: {err}")
-            })?;
 
-            println!("INFO: listening at http://{address}/");
-
-            for request in server.incoming_requests() {
-                match serve_request(&tf_index, request) {
-                    _ => {}
-                }
-            }
-
-            todo!("serve is not implemented yet")
+            return server::start(&address, &tf_index)
         },
         _ => {
             usage(&program);

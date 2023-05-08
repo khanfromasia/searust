@@ -1,16 +1,25 @@
+async function search(prompt) {
+    const results = document.getElementById("results")
+    results.innerHTML = "";
+    const response = await fetch("/api/search", {
+        method: 'POST',
+        headers: {'Content-Type': 'text/plain'},
+        body: prompt,
+    });
+    const json = await response.json();
+    results.innerHTML = "";
+    for ([path, rank] of json) {
+        let item = document.createElement("span");
+        item.appendChild(document.createTextNode(path));
+        item.appendChild(document.createElement("br"));
+        results.appendChild(item);
+    }
+}
 
+let query = document.getElementById("query");
 
-// async function postSearch(url = '', data = {}) {
-    
-// }
-
-// const res = await postSearch('/api/search', { answer: 42  });
-
-fetch("/api/search", {
-    method: 'POST',
-    headers: {
-        'Content-Type': 'text/plain',
-    },
-    body: "haiaaa js, ms css html.  ",
-
-}).then((response) => console.log(response, 'response'))
+query.addEventListener("keypress", async (e) => {
+    if (e.key == "Enter") {
+        await search(query.value);;
+    }
+})
