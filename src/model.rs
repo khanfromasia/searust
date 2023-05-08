@@ -1,11 +1,19 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use serde::{Deserialize, Serialize};
 
+pub type DocFreq = HashMap<String, usize>;
 pub type TermFreq = HashMap::<String, usize>;
-pub type TermFreqIndex = HashMap<PathBuf, TermFreq>;
+pub type TermFreqPerDoc = HashMap<PathBuf, (usize, TermFreq)>;
 
 pub struct Lexer<'a> {
     content: &'a [char],
+}
+
+#[derive(Default, Deserialize, Serialize)]
+pub struct Model {
+    pub tfpd: TermFreqPerDoc,
+    pub df: DocFreq,
 }
 
 impl<'a> Lexer<'a> {
@@ -59,31 +67,28 @@ impl<'a> Iterator for Lexer<'a> {
     }
 }
 
-pub fn term_frequency(term: &str, document: &TermFreq) -> f32 {
-    let a = document.get(term).cloned().unwrap_or(0) as f32;
-    let b  = document.iter().map(|(_, f)| *f).sum::<usize>() as f32;
-    a / b
+pub fn compute_tf(t: &str, n: usize, d: &TermFreq) -> f32 {
+    let n = n as f32;
+    let m = d.get(t).cloned().unwrap_or(0) as f32;
+    m / n
 }
 
-pub fn inverse_document_frequency(term: &str, document: &TermFreqIndex) -> f32 {
-    let n = document.len() as f32;
-    let mut m = document.values().filter(|tf | tf.contains_key(term)).count().max(1) as f32;
-   
-    (n / m).log10() 
+pub fn compute_idf(t: &str, n: usize, df: &DocFreq) -> f32 {
+    let n = n as f32;
+    let m = df.get(t).cloned().unwrap_or(1) as f32;
+    (n / m).log10()
 }
-
-pub fn search_query<'a>(tf_index: &'a TermFreqIndex, query: &'a [char]) -> Vec<(&'a Path, f32)> {
+pub fn search_query<'a>(model: &'a Model, query: &'a [char]) -> Vec<(&'a Path, f32)> {
     let mut result = Vec::<(&Path, f32)>::new();
     let tokens = Lexer::new(&query).collect::<Vec<_>>();
-
-    for (path, tf_table) in tf_index {
+    for (path, (n, tf_table)) in &model.tfpd {
         let mut rank = 0f32;
-        for term in &tokens {
-            rank += term_frequency(&term, tf_table) * inverse_document_frequency(&term, tf_index); 
+        for token in &tokens {
+            rank += compute_tf(&token, *n, tf_table) * compute_idf(&token, model.tfpd.len(), &model.df);
         }
-        result.push((path, rank));  
+        result.push((path, rank));
     }
-    result.sort_by(|(_, rank1),  (_, rank2)| rank1.partial_cmp(rank2).unwrap() );
-    result.reverse(); 
+    result.sort_by(|(_, rank1), (_, rank2)| rank1.partial_cmp(rank2).unwrap());
+    result.reverse();
     result
 }

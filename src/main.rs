@@ -1,10 +1,10 @@
 use std::fs::{self, File};
 use std::path::Path;
-
 use std::env;
 use std::result::Result;
 use std::process::ExitCode;
 use std::str;
+use std::io::{BufReader, BufWriter};
 
 use xml::reader::{XmlEvent, EventReader};
 use xml::common::{Position, TextPosition};
@@ -18,7 +18,7 @@ fn parse_entire_xml_file(file_path: &Path) -> Result<String, ()> {
     let file = File::open(file_path).map_err(|err| {
         eprintln!("ERROR: could not open file {file_path}: {err}", file_path = file_path.display());
     })?;
-    let er = EventReader::new(file);
+    let er = EventReader::new(BufReader::new(file));
     let mut content = String::new();
     for event in er.into_iter() {
         let event = event.map_err(|err| {
@@ -35,21 +35,21 @@ fn parse_entire_xml_file(file_path: &Path) -> Result<String, ()> {
     Ok(content)
 }
 
-fn save_tf_index(tf_index: &TermFreqIndex, index_path: &str) -> Result<(), ()> {
+fn save_model_as_json(model: &Model, index_path: &str) -> Result<(), ()> {
     println!("Saving {index_path}...");
 
     let index_file = File::create(index_path).map_err(|err| {
         eprintln!("ERROR: could not create index file {index_path}: {err}");
     })?;
 
-    serde_json::to_writer(index_file, &tf_index).map_err(|err| {
+    serde_json::to_writer(BufWriter::new(index_file), &model).map_err(|err| {
         eprintln!("ERROR: could not serialize index into file {index_path}: {err}");
     })?;
 
     Ok(())
 }
 
-fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(), ()> {
+fn add_folder_to_model(dir_path: &Path, model: &mut Model) -> Result<(), ()> {
     let dir = fs::read_dir(dir_path).map_err(|err| {
         eprintln!("ERROR: could not open directory {dir_path} for indexing: {err}",
                   dir_path = dir_path.display());
@@ -69,9 +69,11 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
         })?;
 
         if file_type.is_dir() {
-            tf_index_of_folder(&file_path, tf_index)?;
+            add_folder_to_model(&file_path, model)?;
             continue 'next_file;
         }
+
+        // TODO: how does this work with symlinks?
 
         println!("Indexing {:?}...", &file_path);
 
@@ -82,15 +84,26 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
 
         let mut tf = TermFreq::new();
 
-        for term in Lexer::new(&content) { 
+        let mut n = 0;
+
+        for term in Lexer::new(&content) {
             if let Some(freq) = tf.get_mut(&term) {
                 *freq += 1;
             } else {
-                tf.insert(term, 1); 
+                tf.insert(term, 1);
+            }
+            n += 1;
+        }
+
+        for t in tf.keys() {
+            if let Some(freq) = model.df.get_mut(t) {
+                *freq += 1;
+            } else {
+                model.df.insert(t.to_string(), 1);
             }
         }
 
-        tf_index.insert(file_path, tf);
+        model.tfpd.insert(file_path, (n, tf));
     }
 
     Ok(())
@@ -120,9 +133,9 @@ fn entry() -> Result<(), ()> {
                 eprintln!("ERROR: no directory is provided for {subcommand} subcommand");
             })?;
 
-            let mut tf_index = TermFreqIndex::new();
-            tf_index_of_folder(Path::new(&dir_path), &mut tf_index)?;
-            save_tf_index(&tf_index, "index.json")?;
+            let mut model = Default::default();
+            add_folder_to_model(Path::new(&dir_path), &mut model)?;
+            save_model_as_json(&model, "index.json")
         },
         "search" => {
             let index_path = args.next().ok_or_else(|| {
@@ -139,13 +152,14 @@ fn entry() -> Result<(), ()> {
                 eprintln!("ERROR: could not open index file {index_path}: {err}");
             })?;
 
-            let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
+            let model: Model = serde_json::from_reader(index_file).map_err(|err| {
                 eprintln!("ERROR: could not parse index file {index_path}: {err}");
             })?;
 
-            for (path, rank) in search_query(&tf_index, &prompt).iter().take(20) {
+            for (path, rank) in search_query(&model, &prompt).iter().take(20) {
                 println!("{path} {rank}", path = path.display());
             }
+            Ok(())
         },
         "serve" => {
             let index_path = args.next().ok_or_else(|| {
@@ -157,22 +171,20 @@ fn entry() -> Result<(), ()> {
                 eprintln!("ERROR: could not open index file {index_path}: {err}");
             })?;
         
-            let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
+            let model: Model = serde_json::from_reader(index_file).map_err(|err| {
                 eprintln!("ERROR: could not parse index file {index_path}: {err}");
             })?;
         
             let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
 
-            return server::start(&address, &tf_index)
+            server::start(&address, &model)
         },
         _ => {
             usage(&program);
             eprintln!("ERROR: unknown subcommand {subcommand}");
-            return Err(());
+            Err(())
         }
     }
-
-    Ok(())
 }
 
 fn main() -> ExitCode {
