@@ -1,59 +1,66 @@
 use std::fs::File;
 use std::str;
+use std::io;
 
 use super::model::*;
 
 use tiny_http::{Server, Response, Header, Method, Request, StatusCode};
 
-fn serve_static_file(request: Request, file_path: &str, content_type: &str) -> Result<(), ()> {
+
+fn serve_error(request: Request, status_code: i32, message: &str) -> io::Result<()> {
+    request.respond(Response::from_string(format!("{status_code}: {message}")).with_status_code(StatusCode::from(status_code)))
+}
+
+fn serve_static_file(request: Request, file_path: &str, content_type: &str) -> io::Result<()> {
     let content_type_header = Header::from_bytes("Content-Type", content_type)
-        .expect("don't put any garbage into headers");
-            
-    let file = File::open(file_path).map_err(|err| {
-        eprintln!("ERROR: could not serve static file {file_path}: {err}");
-    })?;
+        .expect("That we didn't put any garbage in the headers");
 
-    let response = Response::from_file(file).with_header(content_type_header);
-    request.respond(response).map_err(|err| {
-        eprintln!("ERROR: could not serve a request: {err}");
-    })?;
+    let file = match File::open(file_path) {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("ERROR: could not serve file {file_path}: {err}");
+            if err.kind() == io::ErrorKind::NotFound {
+                return serve_error(request, 404, "not found");
+            }
+            return serve_error(request, 500, "internal server error");
+        }
+    };
 
-    Ok(())
+    request.respond(Response::from_file(file).with_header(content_type_header))
 }
 
-fn serve_404(request: Request) -> Result<(), ()> {
-    request.respond(Response::from_string("404").with_status_code(StatusCode::from(404))).map_err(|err| {
-        eprintln!("ERROR: could not serve a request: {err}");
-    })
-}
-
-fn search_handler(mut request: Request, tf_index: &TermFreqIndex) -> Result<(), ()> {
+fn search_handler(mut request: Request, tf_index: &TermFreqIndex) -> io::Result<()> {
     let mut buf = Vec::new();
-    request.as_reader().read_to_end(&mut buf).map_err(|err| {
+    if let Err(err) = request.as_reader().read_to_end(&mut buf) {
         eprintln!("ERROR: could not read the body of the request: {err}");
-    })?;
+        return serve_error(request, 500, "internal server error");
+    }
 
-    let body = str::from_utf8(&buf).map_err(|err| {
-        eprintln!("ERROR: could not interpert bodt as UTF-8 string: {err}");
-    })?.chars().collect::<Vec<_>>();
+    let body = match str::from_utf8(&buf) {
+        Ok(body) => body.chars().collect::<Vec<_>>(),
+        Err(err) => {
+            eprintln!("ERROR: could not interpret body as UTF-8 string: {err}");
+            return serve_error(request, 400, "body must be a valid UTF-8 string");
+        },
+    };
     
     let result = search_query(&tf_index, &body);
 
-    let json = serde_json::to_string(&result.iter().take(20).collect::<Vec<_>>()).map_err(|err| {
-        eprintln!("ERROR: could not convert search results to JSON: {err}");
-    })?;
+    let json = match serde_json::to_string(&result.iter().take(20).collect::<Vec<_>>()) {
+        Ok(json) => json, 
+        Err(err) => {
+            eprintln!("ERROR: could not convert search results to JSON: {err}");
+            return serve_error(request, 500, "internal server error")
+        },
+    };
 
     let content_type_header = Header::from_bytes("Content-Type", "application/json")
         .expect("That we didn't put any garbage in the headers");
-    let response = Response::from_string(&json)
-        .with_header(content_type_header);
-    
-    request.respond(response).map_err(|err| {
-        eprintln!("ERROR: could not serve a request {err}");
-    })
+
+    request.respond(Response::from_string(&json).with_header(content_type_header))
 }
 
-fn serve_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), ()> {
+fn serve_request(tf_index: &TermFreqIndex, request: Request) -> io::Result<()> {
     println!("INFO: request received: {:?} {:?}", request.method(), request.url());
 
     match request.method() {
@@ -66,7 +73,7 @@ fn serve_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), (
                     serve_static_file(request, "index.js", "text/javascript; charset=utf-8")
                 },
                 _ => {
-                    serve_404(request)
+                    serve_error(request, 404, "not found")
                 }
             }
         },
@@ -76,12 +83,12 @@ fn serve_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), (
                     search_handler(request, tf_index)
                 }, 
                 _ => {
-                    serve_404(request)
+                    serve_error(request, 404, "not found")
                 }
             }
         },
         _ => {
-            serve_404(request)
+            serve_error(request, 404, "not found")
         }
     }
 }  
@@ -96,7 +103,9 @@ pub fn start(address: &str, tf_index: &TermFreqIndex) -> Result<(), ()> {
     println!("INFO: listening at http://{address}/");
 
     for request in server.incoming_requests() {
-        serve_request(&tf_index, request).ok();
+        serve_request(&tf_index, request).map_err(|err| {
+            eprintln!("ERROR: could not serve the response: {err}");
+        }).ok();
     }
 
     eprintln!("ERROR: the server socket has shutdown");
