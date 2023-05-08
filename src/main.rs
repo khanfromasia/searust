@@ -4,11 +4,12 @@ use std::collections::HashMap;
 use std::env;
 use std::result::Result;
 use std::process::ExitCode;
+use std::str;
 
 use xml::reader::{XmlEvent, EventReader};
 use xml::common::{Position, TextPosition};
 
-use tiny_http::{Server, Response};
+use tiny_http::{Server, Response, Header, Method, Request, StatusCode};
 
 struct Lexer<'a> {
     content: &'a [char],
@@ -39,26 +40,26 @@ impl<'a> Lexer<'a> {
         self.chop(n)
     }
 
-    fn next_token(&mut self) -> Option<&'a [char]> {
+    fn next_token(&mut self) -> Option<String> {
         self.trim_left();
         if self.content.is_empty() {
             return None
         }
 
         if self.content[0].is_numeric() {
-            return Some(self.chop_while(|x| x.is_numeric()));
+            return Some(self.chop_while(|x| x.is_numeric()).iter().collect());
         }
 
         if self.content[0].is_alphabetic() {
-            return Some(self.chop_while(|x| x.is_alphanumeric()));
+            return Some(self.chop_while(|x| x.is_alphanumeric()).iter().map(|x| x.to_ascii_uppercase()).collect());
         }
 
-        return Some(self.chop(1));
+        return Some(self.chop(1).iter().collect());
     }
 }
 
 impl<'a> Iterator for Lexer<'a> {
-    type Item = &'a [char];
+    type Item = String;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next_token()
@@ -143,8 +144,6 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
             continue 'next_file;
         }
 
-        // TODO: how does this work with symlinks?
-
         println!("Indexing {:?}...", &file_path);
 
         let content = match parse_entire_xml_file(&file_path) {
@@ -154,12 +153,11 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
 
         let mut tf = TermFreq::new();
 
-        for token in Lexer::new(&content) {
-            let term = token.iter().map(|x| x.to_ascii_uppercase()).collect::<String>();
+        for term in Lexer::new(&content) { 
             if let Some(freq) = tf.get_mut(&term) {
                 *freq += 1;
             } else {
-                tf.insert(term, 1);
+                tf.insert(term, 1); 
             }
         }
 
@@ -172,15 +170,108 @@ fn tf_index_of_folder(dir_path: &Path, tf_index: &mut TermFreqIndex) -> Result<(
 fn usage(program: &str) {
     eprintln!("Usage: {program} [SUBCOMMAND] [OPTIONS]");
     eprintln!("Subcommands:");
-    eprintln!("\tindex <folder>         index the <folder> and save the index to index.json file");
-    eprintln!("\tsearch <index-file>    check how many documents are indexed in the file (searching is not implemented yet)");
-    eprintln!("\tserve                  start local http server with web UI");
+    eprintln!("\tindex <folder>                  index the <folder> and save the index to index.json file");
+    eprintln!("\tsearch <index-file>             check how many documents are indexed in the file (searching is not implemented yet)");
+    eprintln!("\tserve  <index-file> [address]   start local http server with web UI");
 }
 
-fn entry() -> Result<(), ()> {
+fn serve_static_file(request: Request, file_path: &str, content_type: &str) -> Result<(), ()> {
+    let content_type_header = Header::from_bytes("Content-Type", content_type)
+        .expect("don't put any garbage into headers");
+            
+    let file = File::open(file_path).map_err(|err| {
+        eprintln!("ERROR: could not serve static file {file_path}: {err}");
+    })?;
+
+    let response = Response::from_file(file).with_header(content_type_header);
+    request.respond(response).map_err(|err| {
+        eprintln!("ERROR: could not serve a request: {err}");
+    })?;
+
+    Ok(())
+}
+
+fn serve_404(request: Request) -> Result<(), ()> {
+    request.respond(Response::from_string("404").with_status_code(StatusCode::from(404))).map_err(|err| {
+        eprintln!("ERROR: could not serve a request: {err}");
+    })
+}
+
+fn serve_request(tf_index: &TermFreqIndex, mut request: Request) -> Result<(), ()> {
+    println!("INFO: request received: {:?} {:?}", request.method(), request.url());
+
+    match request.method() {
+        Method::Get => {
+            match request.url() {
+                "/" | "/index.html" => {
+                    serve_static_file(request, "index.html", "text/html; charset=utf-8")
+                },
+                "/index.js" => {
+                    serve_static_file(request, "index.js", "text/javascript; charset=utf-8")
+                },
+                _ => {
+                    serve_404(request)
+                }
+            }
+        },
+        Method::Post => {
+            match request.url() {
+                "/api/search" => {
+                    let mut buf = Vec::new();
+                    request.as_reader().read_to_end(&mut buf);
+                    let body = str::from_utf8(&buf).map_err(|err| {
+                        eprintln!("ERROR: could not interpert bodt as UTF-8 string: {err}");
+                    })?.chars().collect::<Vec<_>>();
+                    
+                    let mut  result = Vec::<(&PathBuf, f32)>::new();
+
+                    for (path, tf_table) in tf_index {
+                        let mut rank = 0f32;
+                        for term  in Lexer::new(&body) {
+                            rank += term_frequency(&term, tf_table) * inverse_document_frequency(&term, tf_index); 
+                        }
+                        result.push((path, rank));  
+                    }
+
+                    result.sort_by(|(_, rank1),  (_, rank2)| rank1.partial_cmp(rank2).unwrap() );
+                    result.reverse(); 
+
+                    for (path, rank) in result.iter().take(10 ) {
+                        println!("{path} => {rank}", path = path.display(), rank = rank); 
+                    }
+                    
+                    request.respond(Response::from_string("ok")).map_err(|err| {
+                        eprintln!("ERROR: could not serve a  : {err}");
+                    })
+                }, 
+                _ => {
+                    serve_404(request)
+                }
+            }
+        },
+        _ => {
+            serve_404(request)
+        }
+    }
+}  
+
+fn term_frequency(term: &str, document: &TermFreq) -> f32 {
+    let a = document.get(term).cloned().unwrap_or(0) as f32;
+    let b  = document.iter().map(|(_, f)| *f).sum::<usize>() as f32;
+    a / b
+}
+
+fn inverse_document_frequency(term: &str, document: &TermFreqIndex) -> f32 {
+    let n = document.len() as f32;
+    let mut m = document.values().filter(|tf | tf.contains_key(term)).count().max(1) as f32;
+   
+    (n / m).log10() 
+}
+
+fn entry() -> Result<(), ()> {  
     let mut args = env::args();
     let program = args.next().expect("path to program is provided");
-
+  
     let subcommand = args.next().ok_or_else(|| {
         usage(&program);
         eprintln!("ERROR: no subcommand is provided");
@@ -201,12 +292,38 @@ fn entry() -> Result<(), ()> {
             let index_path = args.next().ok_or_else(|| {
                 usage(&program);
                 eprintln!("ERROR: no path to index is provided for {subcommand} subcommand");
-            })?;
+            })?;  
 
             check_index(&index_path)?;
         },
         "serve" => {
-            let server = Server::http("127.0.0.1:6969").unwrap(); 
+            let index_path = args.next().ok_or_else(|| {
+                usage(&program);
+                eprintln!("ERROR: no path to index is provided for {subcommand} subcommand");
+            })?;
+ 
+            let index_file = File::open(&index_path).map_err(|err| {
+                eprintln!("ERROR: could not open index file {index_path}: {err}");
+            })?;
+        
+            let tf_index: TermFreqIndex = serde_json::from_reader(index_file).map_err(|err| {
+                eprintln!("ERROR: could not parse index file {index_path}: {err}");
+            })?;
+        
+
+            let address = args.next().unwrap_or("127.0.0.1:6969".to_string());
+            let server = Server::http(&address).map_err(|err| {
+                eprintln!("ERROR: could not start http server at {address}: {err}")
+            })?;
+
+            println!("INFO: listening at http://{address}/");
+
+            for request in server.incoming_requests() {
+                match serve_request(&tf_index, request) {
+                    _ => {}
+                }
+            }
+
             todo!("serve is not implemented yet")
         },
         _ => {
